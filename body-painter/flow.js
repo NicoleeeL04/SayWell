@@ -1,7 +1,8 @@
-import {dentalSuggestions} from './dental-regions.js';
+import {dentalSuggestions,relativeToothPosition} from './dental-regions.js?v=tooth-preview-1';
 import {activeModel,dental,setDentalReadOnly,notifyModelVisibility,selectModel} from './model-switcher.js';
 import {FIELDS,statementFor,escapeHTML} from './symptoms.js';
 import {REGIONS,regionLabel,regionText} from './regions.js';
+import {loadHistory,createRecord,saveRecord,thumbnail} from './history.js';
 const $ = id => document.getElementById(id);
 let messages = [], regions = [], ai = false, busy = false, step = 1, valid = false;
 let reviewVersion = 0, summaryVersion = -1, manualDrawing = false, mapKey = null, mapJob = 0;
@@ -9,31 +10,47 @@ let lastUserBubble = null, interpretationFailed = false;
 const details = Object.fromEntries(Object.keys(FIELDS).map(key => [key, '']));
 const translations = [];
 let dentalReport={involved:false,locations:[]}, dentalKey=null, dentalManual=false, dentalJob=0;
+let dentalCountFrom=null, dentalCountContext=null;
+
+function currentDentalSuggestion(){
+  const text=$('review-english').value;
+  const query=relativeToothPosition(text);
+  const context=JSON.stringify({locations:dentalReport.locations,query});
+  if(context!==dentalCountContext){dentalCountFrom=null;dentalCountContext=context;}
+  return dentalSuggestions(dentalReport,{text,countFrom:dentalCountFrom});
+}
+function updateDentalCountQuestion(suggestion){
+  $('dental-count-question').hidden=step!==2||dentalManual||!(suggestion.needsCount||dentalCountFrom);
+  for(const [id,reference] of [['count-from-model','model'],['count-from-wisdom','wisdom']]){
+    const displayedReference=dentalCountFrom||relativeToothPosition($('review-english').value).reference||'model';
+    $(id).setAttribute('aria-pressed',String(displayedReference===reference));
+  }
+}
 
 const notice = text => {
   const element=$('notice');
   $(step===1?'chat-notice-slot':step===2?'review-notice-slot':'summary-notice-slot').append(element);
   element.textContent=text;
   element.hidden=!text;
-  element.dataset.tone=/copied|downloaded|Manual mode is on/i.test(text)?'success':'info';
+  element.dataset.tone=/copied|downloaded|Manual mode is on|Saved to your history/i.test(text)?'success':'info';
 };
 function refreshReviewCopy(){
   const final=step===3;
-  $('body-map-help').textContent=final?'This is your reviewed body map. Return to edit the markings.':'No specific location? It’s okay to leave the body unmarked.';
-  $('dental-map-help').textContent=final?'This is your reviewed dental map. Return to edit the selected teeth and gums.':'Select a tooth alone, or include its adjacent gum. Dental markings are kept separately from body drawings.';
+  $('body-map-help').textContent='Illustrative model. Review all markings.';
+  $('dental-map-help').textContent='Illustrative model. Wisdom teeth are not shown.';
   for(const id of ['map-status','dental-status']){
     const el=$(id);
     if(final){
       if(!el.dataset.reviewCopy)el.dataset.reviewCopy=el.textContent;
-      if(id==='map-status')el.textContent='Your reviewed markings are kept with your statement. Rotate the model to view them.';
-      else{const suggestion=dentalSuggestions(dentalReport);el.textContent=suggestion.unsupported?'Wisdom teeth are not shown in this model. Your description still includes the symptom.':suggestion.uncertain&&!dentalManual?'Highlighted teeth indicate a candidate area, not a confirmed painful tooth.':'Your reviewed tooth and gum selections are kept with your statement.';}
+      if(id==='map-status')el.textContent='Reviewed markings';
+      else{const suggestion=currentDentalSuggestion();el.textContent=!dentalManual&&suggestion.needsManual?'Tooth not identified. The description is kept.':!dentalManual&&suggestion.needsCount?'Suggested tooth, counted without wisdom teeth.':suggestion.unsupported?'Wisdom teeth are not shown; the symptom remains in your description.':suggestion.uncertain&&!dentalManual?'Suggested area; confirm which tooth hurts.':'Reviewed selections';}
     }else if(el.dataset.reviewCopy){el.textContent=el.dataset.reviewCopy;delete el.dataset.reviewCopy;}
   }
 }
 
 function locationLabels(){
   const body = regions.map(regionText);
-  const candidate = !dentalManual && dentalSuggestions(dentalReport).uncertain;
+  const candidate = !dentalManual && currentDentalSuggestion().uncertain;
   const teeth = (dental()?.getState().selections || []).map(s => `${candidate ? 'Candidate tooth' : 'Tooth'} ${s.tooth} (${s.label})${s.includesGum ? ' and adjacent gum' : ''}`);
   return [...body,...teeth];
 }
@@ -41,17 +58,25 @@ function updateModelCaption(){
   const isDental = activeModel() === 'dental';
   $('body-location-fields').hidden=isDental;
   $('apply-marks').hidden=isDental;
-  $('location-help').textContent=isDental?'Highlighted teeth may represent a suggested area. Select or deselect teeth to refine it, and update the English account if needed.':'Suggested body marks are approximate. Paint or erase to correct them. Check both the markings and the English account.';
-  $('map-title').textContent = isDental ? 'Your dental map' : 'Your body map';
-  $('map-caption').textContent = step === 3 ? 'Your reviewed markings. Drag to rotate.' : isDental ? 'Select a tooth, or include its adjacent gum.' : 'Mark where you feel it. You’re in control.';
+  $('map-title').textContent = isDental ? 'Dental map' : 'Body map';
+  updateDentalCountQuestion(currentDentalSuggestion());
   refreshReviewCopy();
 }
 document.addEventListener('modelchange',updateModelCaption);
-document.addEventListener('dentalchange',event=>{if(event.detail?.source!=='automatic')dentalManual=true;invalidate();});
+document.addEventListener('dentalchange',event=>{
+  if(event.detail?.source!=='automatic'){
+    dentalManual=true;
+    $('dental-count-question').hidden=true;
+    $('dental-status').textContent='Your selection. Check the tooth and gum.';
+  }
+  invalidate();
+});
 
 async function syncDental(force=false) {
   if(step===1)return;
-  const key=JSON.stringify(dentalReport),job=++dentalJob;
+  const suggestion=currentDentalSuggestion();
+  updateDentalCountQuestion(suggestion);
+  const key=JSON.stringify({report:dentalReport,query:relativeToothPosition($('review-english').value),countFrom:dentalCountFrom}),job=++dentalJob;
   $('confirmed').disabled=dentalReport.involved&&!$('dental-model').contentWindow?.modelReady;
   if(!dentalReport.involved&&!dental())return;
   for(let attempt=0;!$('dental-model').contentWindow?.modelReady&&attempt<200;attempt++) {
@@ -63,18 +88,30 @@ async function syncDental(force=false) {
   if(!$('dental-model').contentWindow?.modelReady){$('dental-status').textContent='The dental model could not load. Your English account is still available. Please reload to try again.';return;}
   setDentalReadOnly(step===3);
   if(!force&&key===dentalKey)return;
-  $('apply-dental').hidden=step===3;
-  if(!force&&dentalManual){$('dental-status').textContent='Your dental description changed. Your manual selections are kept. Replace them with the suggestions, or review them yourself.';return;}
-  const suggestion=dentalSuggestions(dentalReport);
+  $('apply-dental').hidden=step===3||suggestion.needsCount||suggestion.needsManual;
+  if(!force&&dentalManual){$('dental-status').textContent='Description changed. Your manual selections are kept.';return;}
   dental().markTeeth(suggestion.selections);
   dentalKey=key;dentalManual=false;
-  $('dental-status').textContent=suggestion.unsupported
-    ? 'Wisdom teeth are not included in this 28-tooth model. That symptom remains in your English account; no substitute tooth is selected.'
+  updateDentalCountQuestion(suggestion);
+  $('dental-status').textContent=suggestion.needsCount
+    ? 'Preview: one tooth, counted without wisdom teeth. Check the location.'
+    :suggestion.needsManual
+    ? 'Tooth not identified. Select it on the model.'
+    :suggestion.unsupported
+    ? 'Wisdom teeth are not shown; the symptom remains in your description.'
     :suggestion.selections.length
-      ?suggestion.uncertain?'Highlighted teeth show a possible area, not a confirmed painful tooth. Click to refine the selection. Left and right are your own sides.':'The reported tooth is highlighted. Check it and adjust if needed. Left and right are your own sides.'
-      :dentalReport.involved?'Dental symptoms detected, but the tooth is not yet identified. Select the painful tooth, or tell the chat which side and upper/lower jaw.':'No dental symptom reported. You may still select a tooth manually.';
+      ?suggestion.uncertain?'Suggested area, not a confirmed tooth. Select the tooth that hurts.':'Check the selected tooth. Left and right are your own sides.'
+      :dentalReport.involved?'Select the tooth that hurts.':'No teeth selected.';
 }
 $('apply-dental').onclick=()=>void syncDental(true);
+for(const [id,reference] of [['count-from-model','model'],['count-from-wisdom','wisdom']]){
+  $(id).onclick=()=>{
+    if(step!==2)return;
+    dentalCountFrom=reference;
+    dentalManual=false;
+    void syncDental(true);
+  };
+}
 
 function painterRoot() { return $('painter').contentDocument?.getElementById('skin-paint'); }
 function painter() { return painterRoot()?.skinPaint; }
@@ -176,7 +213,7 @@ async function syncMap(force = false) {
   // A slow GLB load must not silently drop the first automatic annotation.
   for (let attempt = 0; !painter() && attempt < 150; attempt++) {
     if (painterRoot()?.dataset.error) break;
-    $('map-status').textContent = 'Loading the body before adding your markings…';
+    $('map-status').textContent = 'Loading model…';
     await new Promise(resolve => setTimeout(resolve, 100));
     if (job !== mapJob || step === 1) return;
     bindPainter();
@@ -189,7 +226,7 @@ async function syncMap(force = false) {
   api.setReadOnly(step === 3);
   if (!force && key === mapKey) return;
   if (!force && manualDrawing) {
-    $('map-status').textContent = 'Your locations changed. Your hand-drawn corrections are kept. Choose “Replace drawing” to use the new suggested areas.';
+    $('map-status').textContent = 'Locations changed. Your drawing is kept; use “Replace drawing” to update it.';
     return;
   }
   const result = api.markRegions(regions);
@@ -199,24 +236,23 @@ async function syncMap(force = false) {
   $('map-status').textContent = result.missing.length
     ? `Could not mark ${result.missing.map(regionText).join(', ')}. Please paint those areas yourself.`
     : result.marked.length
-      ? `${result.marked.length} area${result.marked.length === 1 ? '' : 's'} painted on the model. Check the side and exact position, then draw or erase to adjust.`
-      : 'No specific body location reported. You can leave the model unmarked or draw a location yourself.';
+      ? `${result.marked.length} area${result.marked.length === 1 ? '' : 's'} marked. Check the location.`
+      : 'No areas marked.';
 }
 function changeStep(next) {
   if (busy || next !== 1 && !valid || next === 3 && !$('confirmed').checked) return;
   step = next;
   document.body.dataset.step=String(next);
   notice('');
-  for (const [id, visible] of Object.entries({conversation:next === 1, welcome:next === 1, details:next === 2, summary:next === 3, 'model-card':next !== 1, 'review-actions':next === 2})) $(id).hidden = !visible;
-  $('page-title').textContent = ['', 'Let’s start with how you feel.', 'Make sure it feels right.', 'Your words, ready to be heard.'][next];
-  $('step-label').textContent=['','STEP 01 · DESCRIBE','STEP 02 · REVIEW & LOCATE','STEP 03 · YOUR STATEMENT'][next];
-  $('page-subtitle').textContent = ['', 'Tell us what’s bothering you, in whatever language feels easiest.', 'Check the English description and the painted areas. Correct anything we missed.', 'Your own account, ready for a conversation with a clinician.'][next];
-  $('map-caption').textContent = next === 3 ? 'Your reviewed markings. Drag to rotate.' : 'Paint what you feel. You’re in control.';
+  for (const [id, visible] of Object.entries({conversation:next === 1, details:next === 2, summary:next === 3, 'model-card':next !== 1, 'review-actions':next === 2})) $(id).hidden = !visible;
+  $('page-title').textContent = ['', 'Describe your symptoms', 'Review your description', 'Your statement'][next];
   updateModelCaption();
   setDentalReadOnly(next === 3);
   notifyModelVisibility();
   updateNavigation();
-  $('apply-dental').hidden=next===3||!dentalReport.involved;
+  const dentalSuggestion=currentDentalSuggestion();
+  updateDentalCountQuestion(dentalSuggestion);
+  $('apply-dental').hidden=next===3||!dentalReport.involved||dentalSuggestion.needsCount||dentalSuggestion.needsManual;
   if (next !== 1) {void syncMap();void syncDental();}
   $('page-title').focus({preventScroll:true});
   $('page-title').scrollIntoView({block:'start',behavior:'instant'});
@@ -257,7 +293,7 @@ function setBusy(value) {
   $('description').disabled = value;
   $('consent').disabled = value;
   $('messages').setAttribute('aria-busy',String(value));
-  $('send').textContent = value ? 'Listening…' : 'Send message ↗';
+  $('send').textContent = value ? 'Translating…' : 'Send';
   $('thinking').hidden = !value;
   updateNavigation();
 }
@@ -289,13 +325,14 @@ async function interpret() {
     messages.push({role:'assistant', content:data.reply});
     valid = Boolean(data.statement.trim());
     interpretationFailed = false;
-    $('to-body').textContent = data.ready ? 'Review my description →' : 'Review so far →';
-    $('chat-progress').textContent = valid ? 'Add more details, or review whenever you’re ready.' : 'Tell us a little about how you’re feeling to get started.';
+    $('to-body').textContent = data.ready ? 'Review description' : 'Review description';
+    $('chat-progress').hidden = true;
   } catch (error) {
     interpretationFailed = true;
     $('retry').hidden = false;
     notice(error.name === 'TimeoutError' ? 'That took too long. Retry your last message, or continue without AI.' : error.message);
-    $('chat-progress').textContent = 'Your latest message has not been translated. Retry before reviewing.';
+    $('chat-progress').textContent = 'Translation failed. Retry to continue.';
+    $('chat-progress').hidden = false;
   } finally {
     setBusy(false);
     $('messages').scrollTop = $('messages').scrollHeight;
@@ -343,13 +380,49 @@ $('download').onclick = () => {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
   notice('Notes downloaded, including your original words and their translations.');
 };
+// --- Personal history (this browser only; full view in history.html) ---
+let historyId = null;
+function historyCount() {
+  const count = loadHistory().length;
+  $('history-count').textContent = String(count);
+  $('history-count').hidden = !count;
+}
+$('open-history').onclick = event => {
+  if (messages.length && !historyId && !window.confirm('Open your history? Your current description hasn’t been saved and will be cleared.')) event.preventDefault();
+};
+$('save-history').onclick = async () => {
+  const isDental = activeModel() === 'dental';
+  let image = '';
+  try { image = await thumbnail(isDental ? dental()?.snapshot() : painter()?.snapshot()); } catch {}
+  const record = createRecord({
+    id: historyId,
+    statement: $('statement').value,
+    locations: locationLabels(),
+    areas: [...regions.map(r => regionLabel(r.region)), ...((dental()?.getState().selections || []).length ? ['teeth & gums'] : [])],
+    originals: translations,
+    model: isDental ? 'dental' : 'body',
+    image,
+  });
+  try {
+    const updating = Boolean(historyId);
+    saveRecord(record);
+    historyId = record.id;
+    historyCount();
+    notice(updating ? 'History entry updated.' : 'Saved to your history on this device.');
+  } catch {
+    notice('Couldn’t save to history. Your browser may block storage (for example in private browsing).');
+  }
+};
+historyCount();
+
 function configureMode() {
   $('use-manual').hidden = !ai;
   $('connection').textContent = ai ? 'AI translation' : 'Manual mode';
   $('consent-row').hidden = !ai;
   $('fields').hidden = ai;
-  $('review-note').textContent = ai ? 'Read the English description and change anything that doesn’t match what you meant. Your original words and translations stay in the conversation.' : 'Write an English description, or fill in the optional details below. Your original words remain available; manual mode does not translate them.';
-  $('privacy').textContent = ai ? 'Notes clear when this page is refreshed. You choose what to share.' : 'Manual mode: no automatic translation. Notes stay in this tab and clear on refresh.';
+  $('review-note').hidden = ai;
+  $('review-note').textContent = 'Enter the description in English. Manual mode does not translate.';
+  $('privacy').textContent = ai ? 'Unsaved notes clear on refresh.' : 'Manual mode does not translate. Unsaved notes clear on refresh.';
 }
 $('use-manual').onclick = () => {
   if (busy) return;

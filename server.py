@@ -76,8 +76,11 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path!='/api/interpret':
             return self.send_json(404,{'error':'Not found'})
         # Browser calls must be same origin. Bind locally, with no CORS allowance.
+        # Behind an HTTPS proxy (Replit, Render) the page origin is https:// and the
+        # public host may arrive as X-Forwarded-Host.
         origin=self.headers.get('Origin')
-        if origin and origin != 'http://'+self.headers.get('Host',''):
+        hosts={h for h in (self.headers.get('Host',''),self.headers.get('X-Forwarded-Host','').split(',')[0].strip()) if h}
+        if origin and origin not in {f'{scheme}://{h}' for h in hosts for scheme in ('http','https')}:
             return self.send_json(403,{'error':'Origin not allowed'})
         key=os.environ.get('OPENAI_API_KEY')
         if not key:
@@ -101,5 +104,7 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__=='__main__':
     load_local_env()
     port=int(os.environ.get('PORT','8080'))
+    # Local by default; hosting platforms set HOST=0.0.0.0 to accept outside traffic.
+    host=os.environ.get('HOST','127.0.0.1')
     print(f'Say Well: http://localhost:{port} (AI {"on" if os.environ.get("OPENAI_API_KEY") else "off"})')
-    ThreadingHTTPServer(('127.0.0.1',port),Handler).serve_forever()
+    ThreadingHTTPServer((host,port),Handler).serve_forever()
